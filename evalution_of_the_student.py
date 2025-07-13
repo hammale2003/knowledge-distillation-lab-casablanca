@@ -62,18 +62,7 @@ class ModelPerformanceTracker:
     def get_comparison_df(self):
         return pd.DataFrame(self.metrics)
 
-class ContinualLearningTracker:
-    def __init__(self):
-        self.task_results = []
-        self.forgetting_scores = []
-        
-    def add_task_result(self, task_id, method, accuracy, forgetting_score=None):
-        self.task_results.append({
-            'task_id': task_id,
-            'method': method,
-            'accuracy': accuracy,
-            'forgetting_score': forgetting_score or 0
-        })
+
 
 # Chargement des modèles
 def load_models():
@@ -284,340 +273,9 @@ def compare_models():
         return f"Erreur lors de la comparaison: {str(e)}", None, None
 
 # Onglet 2: Apprentissage Continu
-class ContinualLearningExperiment:
-    def __init__(self, model, processor):
-        self.original_model = copy.deepcopy(model)
-        self.model = model
-        self.processor = processor
-        self.task_accuracies = {}
-        
-    def create_tasks(self, dataset, num_tasks=4):
-        """Divise les classes en tâches successives"""
-        classes_per_task = NUM_CLASSES // num_tasks
-        tasks = []
-        
-        for task_id in range(num_tasks):
-            start_class = task_id * classes_per_task
-            end_class = (task_id + 1) * classes_per_task
-            if task_id == num_tasks - 1:  # Dernière tâche prend les classes restantes
-                end_class = NUM_CLASSES
-            
-            task_classes = list(range(start_class, end_class))
-            task_data = dataset.filter(lambda x: x['label'] in task_classes)
-            tasks.append(task_data)
-            
-        return tasks
-    
-    def evaluate_on_task(self, task_data, task_id):
-        """Évalue le modèle sur une tâche spécifique"""
-        dataloader = DataLoader(task_data.select(range(min(100, len(task_data)))), 
-                               batch_size=8, shuffle=False, collate_fn=custom_collate_fn)
-        accuracy, _, _, _, _ = evaluate_model(self.model, self.processor, dataloader, DEVICE)
-        return accuracy
-    
-    def train_on_task(self, task_data, epochs=2):
-        """Entraîne le modèle sur une tâche"""
-        self.model.train()
-        self.model.to(DEVICE)  # Ensure model is on the correct device
-        optimizer = optim.AdamW(self.model.parameters(), lr=1e-4)
-        criterion = nn.CrossEntropyLoss()
-        
-        train_data = task_data.select(range(min(200, len(task_data))))
-        dataloader = DataLoader(train_data, batch_size=8, shuffle=True, collate_fn=custom_collate_fn)
-        
-        for epoch in range(epochs):
-            for batch in dataloader:
-                images = batch['image']
-                labels = torch.tensor(batch['label'], dtype=torch.long).to(DEVICE)
-                
-                # Convert images to RGB to ensure 3 dimensions
-                images = ensure_rgb_images(images)
-                
-                inputs = self.processor(images, return_tensors="pt")
-                # Ensure all inputs are on the same device as model
-                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-                
-                outputs = self.model(**inputs)
-                
-                loss = criterion(outputs.logits, labels)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-    
-    def calculate_forgetting(self, tasks, current_task_id):
-        """Calcule l'oubli catastrophique"""
-        forgetting_scores = []
-        
-        for task_id in range(current_task_id):
-            if task_id in self.task_accuracies:
-                current_acc = self.evaluate_on_task(tasks[task_id], task_id)
-                original_acc = self.task_accuracies[task_id]
-                forgetting = max(0, original_acc - current_acc)
-                forgetting_scores.append(forgetting)
-        
-        return np.mean(forgetting_scores) if forgetting_scores else 0
 
-def run_continual_learning_experiment(selected_methods, num_tasks):
-    try:
-        # Chargement des modèles
-        student_model, student_processor, _, _ = load_models()
-        if student_model is None:
-            return "Erreur lors du chargement des modèles", None, None
-        
-        # Chargement du dataset
-        dataset = load_rvl_dataset()
-        if dataset is None:
-            return "Erreur lors du chargement du dataset", None, None
-        
-        # Création de l'expérience
-        experiment = ContinualLearningExperiment(student_model, student_processor)
-        
-        # Division en tâches
-        train_data = dataset['train'].select(range(min(1000, len(dataset['train']))))
-        tasks = experiment.create_tasks(train_data, num_tasks=num_tasks)
-        
-        # Méthodes disponibles
-        all_methods = {
-            'Naive': 'naive',
-            'Rehearsal': 'rehearsal',
-            'LwF (Learning without Forgetting)': 'lwf'
-        }
-        
-        # Filtrer selon les méthodes sélectionnées
-        methods = {name: code for name, code in all_methods.items() if name in selected_methods}
-        
-        results = []
-        
-        for method_name, method_code in methods.items():
-            print(f"Test de la méthode: {method_name}")
-            
-            # Réinitialiser le modèle
-            experiment.model = copy.deepcopy(experiment.original_model)
-            experiment.task_accuracies = {}
-            
-            task_results = []
-            forgetting_scores = []
-            
-            for task_id, task_data in enumerate(tasks):
-                print(f"  Tâche {task_id + 1}/{len(tasks)}")
-                
-                # Entraînement sur la tâche courante
-                if method_code == 'naive':
-                    experiment.train_on_task(task_data)
-                elif method_code == 'rehearsal':
-                    # Simulation améliorée du rehearsal
-                    if task_id > 0:
-                        # Prendre 75% de la tâche courante + 25% des tâches précédentes
-                        current_size = min(150, len(task_data))
-                        rehearsal_size = current_size // 3  # 25% en rehearsal
-                        
-                        current_subset = task_data.select(range(current_size))
-                        
-                        # Combiner données de toutes les tâches précédentes
-                        all_previous = []
-                        for prev_task_id in range(task_id):
-                            prev_subset = tasks[prev_task_id].select(range(min(rehearsal_size // task_id + 1, len(tasks[prev_task_id]))))
-                            all_previous.extend(prev_subset)
-                        
-                        if all_previous:
-                            # Simulation de l'entraînement avec rehearsal
-                            experiment.train_on_task(current_subset, epochs=1)
-                            # Puis un entraînement léger sur les anciennes données
-                            if len(all_previous) > 0:
-                                rehearsal_dataset = all_previous[:rehearsal_size]
-                                # Créer un dataset temporaire pour le rehearsal
-                                rehearsal_data = {'image': [item['image'] for item in rehearsal_dataset],
-                                                'label': [item['label'] for item in rehearsal_dataset]}
-                                # Simulation simple d'entraînement avec ces données
-                                experiment.train_on_task(task_data.select(range(min(50, len(task_data)))), epochs=1)
-                        else:
-                            experiment.train_on_task(task_data)
-                    else:
-                        experiment.train_on_task(task_data)
-                elif method_code == 'lwf':
-                    # Simulation basique de LwF (moins d'époques pour "préserver")
-                    experiment.train_on_task(task_data, epochs=1)
-                
-                # Évaluation
-                accuracy = experiment.evaluate_on_task(task_data, task_id)
-                experiment.task_accuracies[task_id] = accuracy
-                
-                # Calcul de l'oubli
-                forgetting = experiment.calculate_forgetting(tasks, task_id)
-                
-                task_results.append(accuracy)
-                forgetting_scores.append(forgetting)
-                
-                results.append({
-                    'method': method_name,
-                    'task': task_id + 1,
-                    'accuracy': accuracy,
-                    'forgetting': forgetting
-                })
-        
-        # Création des graphiques améliorés
-        df_results = pd.DataFrame(results)
-        
-        if len(methods) > 0:
-            # Style et couleurs améliorés
-            plt.style.use('default')
-            colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D']
-            markers = ['o', 's', '^', 'D']
-            
-            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            fig.suptitle('📊 Analyse de l\'Apprentissage Continu', fontsize=16, fontweight='bold')
-            
-            # 1. Performance par tâche - Lignes plus visibles
-            for i, method in enumerate(methods.keys()):
-                method_data = df_results[df_results['method'] == method]
-                axes[0,0].plot(method_data['task'], method_data['accuracy'], 
-                            marker=markers[i], label=method, linewidth=3, markersize=10,
-                            color=colors[i], markerfacecolor='white', markeredgewidth=2)
-                
-                # Annotations des valeurs
-                for _, row in method_data.iterrows():
-                    axes[0,0].annotate(f'{row["accuracy"]:.2f}', 
-                                     (row['task'], row['accuracy']),
-                                     textcoords="offset points", xytext=(0,10), ha='center',
-                                     fontsize=9, fontweight='bold')
-            
-            axes[0,0].set_xlabel('Numéro de Tâche', fontsize=12, fontweight='bold')
-            axes[0,0].set_ylabel('Accuracy', fontsize=12, fontweight='bold')
-            axes[0,0].set_title('🎯 Évolution des Performances', fontsize=14, fontweight='bold')
-            axes[0,0].legend(fontsize=11)
-            axes[0,0].grid(True, alpha=0.3)
-            axes[0,0].set_ylim([0, max(1, df_results['accuracy'].max() * 1.1)])
-            axes[0,0].set_xticks(range(1, num_tasks + 1))
-            
-            # 2. Oubli catastrophique - Plus contrasté
-            for i, method in enumerate(methods.keys()):
-                method_data = df_results[df_results['method'] == method]
-                axes[0,1].plot(method_data['task'], method_data['forgetting'], 
-                            marker=markers[i], label=method, linewidth=3, markersize=10,
-                            color=colors[i], markerfacecolor='white', markeredgewidth=2)
-                
-                # Annotations des valeurs d'oubli
-                for _, row in method_data.iterrows():
-                    if row['forgetting'] > 0.01:  # Seulement si significatif
-                        axes[0,1].annotate(f'{row["forgetting"]:.2f}', 
-                                         (row['task'], row['forgetting']),
-                                         textcoords="offset points", xytext=(0,10), ha='center',
-                                         fontsize=9, fontweight='bold')
-            
-            axes[0,1].set_xlabel('Numéro de Tâche', fontsize=12, fontweight='bold')
-            axes[0,1].set_ylabel('Score d\'Oubli', fontsize=12, fontweight='bold')
-            axes[0,1].set_title('🧠 Oubli Catastrophique', fontsize=14, fontweight='bold')
-            axes[0,1].legend(fontsize=11)
-            axes[0,1].grid(True, alpha=0.3)
-            axes[0,1].set_xticks(range(1, num_tasks + 1))
-            
-            # 3. Comparaison finale des performances
-            avg_performance = df_results.groupby('method')['accuracy'].mean()
-            bars1 = axes[1,0].bar(range(len(avg_performance)), avg_performance.values, 
-                                color=colors[:len(avg_performance)], alpha=0.8, width=0.6)
-            axes[1,0].set_ylabel('Accuracy Finale Moyenne', fontsize=12, fontweight='bold')
-            axes[1,0].set_title('📊 Performance Finale', fontsize=14, fontweight='bold')
-            axes[1,0].set_xticks(range(len(avg_performance)))
-            axes[1,0].set_xticklabels(avg_performance.index, rotation=45, ha='right')
-            axes[1,0].grid(True, alpha=0.3, axis='y')
-            axes[1,0].set_ylim([0, 1])
-            
-            for i, (bar, value) in enumerate(zip(bars1, avg_performance.values)):
-                axes[1,0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
-                            f'{value:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
-            
-            # 4. Matrice de comparaison oubli vs performance
-            methods_list = list(methods.keys())
-            performance_data = [df_results[df_results['method'] == m]['accuracy'].mean() for m in methods_list]
-            forgetting_data = [df_results[df_results['method'] == m]['forgetting'].mean() for m in methods_list]
-            
-            scatter = axes[1,1].scatter(forgetting_data, performance_data, 
-                                     s=200, c=colors[:len(methods_list)], alpha=0.7, edgecolors='black', linewidth=2)
-            
-            for i, method in enumerate(methods_list):
-                axes[1,1].annotate(method, (forgetting_data[i], performance_data[i]), 
-                                 xytext=(5, 5), textcoords='offset points', fontweight='bold', fontsize=10)
-            
-            axes[1,1].set_xlabel('Oubli Moyen', fontsize=12, fontweight='bold')
-            axes[1,1].set_ylabel('Performance Moyenne', fontsize=12, fontweight='bold')
-            axes[1,1].set_title('⚖️ Trade-off Performance vs Oubli', fontsize=14, fontweight='bold')
-            axes[1,1].grid(True, alpha=0.3)
-            
-            # Zone idéale (performance haute, oubli bas)
-            if len(forgetting_data) > 0 and len(performance_data) > 0:
-                axes[1,1].axhline(y=np.mean(performance_data), color='green', linestyle='--', alpha=0.5, label='Performance médiane')
-                axes[1,1].axvline(x=np.mean(forgetting_data), color='red', linestyle='--', alpha=0.5, label='Oubli médian')
-                axes[1,1].legend(fontsize=10)
-            
-            plt.tight_layout()
-        else:
-            fig = plt.figure(figsize=(10, 6))
-            plt.text(0.5, 0.5, 'Aucune méthode sélectionnée', 
-                    ha='center', va='center', fontsize=16)
-            plt.axis('off')
-        
-        # Rapport détaillé
-        report = f"""
-        🧠 RAPPORT D'APPRENTISSAGE CONTINU
-        
-        📋 CONFIGURATION:
-        - Nombre de tâches: {len(tasks)}
-        - Classes par tâche: {NUM_CLASSES // len(tasks)}
-        - Méthodes testées: {', '.join(methods.keys())}
-        
-        📊 RÉSULTATS MOYENS:
-        """
-        
-        for method in methods.keys():
-            method_data = df_results[df_results['method'] == method]
-            avg_acc = method_data['accuracy'].mean()
-            avg_forgetting = method_data['forgetting'].mean()
-            report += f"""
-        {method}:
-        - Accuracy moyenne: {avg_acc:.4f}
-        - Oubli moyen: {avg_forgetting:.4f}
-        """
-        
-        if len(methods) > 0:
-            # Analyser les résultats
-            best_method = df_results.groupby('method')['accuracy'].mean().idxmax()
-            worst_forgetting = df_results.groupby('method')['forgetting'].mean().idxmin()
-            
-            report += f"""
-        
-        🏆 RÉSULTATS CLÉS:
-        - Meilleure performance moyenne: {best_method}
-        - Moins d'oubli catastrophique: {worst_forgetting}
-        
-        🔍 ANALYSE DÉTAILLÉE:
-        """
-            
-            for method in methods.keys():
-                method_data = df_results[df_results['method'] == method]
-                avg_acc = method_data['accuracy'].mean()
-                avg_forgetting = method_data['forgetting'].mean()
-                report += f"        • {method}: Accuracy={avg_acc:.3f}, Oubli={avg_forgetting:.3f}\n"
-            
-            report += f"""
-        
-        📊 OBSERVATIONS:
-        - L'oubli catastrophique augmente avec le nombre de tâches
-        - Les méthodes de régularisation (LwF, Rehearsal) préservent mieux les connaissances
-        - Le compromis performance/oubli varie selon l'application
-        
-        💡 RECOMMANDATIONS:
-        - Applications critiques → Rehearsal (moins d'oubli)
-        - Contraintes mémoire → LwF (bon équilibre)
-        - Prototypage rapide → Naive (simple mais oubli important)
-        """
-        else:
-            report = "⚠️ Veuillez sélectionner au moins une méthode d'apprentissage continu."
-        
-        return report, fig
-        
-    except Exception as e:
-        return f"Erreur lors de l'expérience d'apprentissage continu: {str(e)}", None
+
+
 
 # Évaluation RÉELLE de l'oubli catastrophique
 class CatastrophicForgettingEvaluator:
@@ -627,9 +285,11 @@ class CatastrophicForgettingEvaluator:
         self.processor = processor
         self.baseline_performance = {}
         self.after_training_performance = {}
-        self.ewc_performance = {}
+        self.continual_performance = {}
         self.fisher_information = {}
         self.optimal_params = {}
+        self.teacher_logits = {}  # Pour LwF
+        self.continual_method = None
         
     def evaluate_baseline(self, dataset):
         """Évaluation baseline du modèle sur toutes les classes"""
@@ -691,8 +351,8 @@ class CatastrophicForgettingEvaluator:
         return class_accuracy
     
     def fine_tune_on_subset(self, dataset, target_classes, epochs=3):
-        """Fine-tune le modèle sur un sous-ensemble de classes"""
-        print(f"🎯 Fine-tuning sur les classes: {target_classes}")
+        """Fine-tune le modèle sur un sous-ensemble de classes (méthode standard)"""
+        print(f"🎯 Fine-tuning STANDARD sur les classes: {target_classes}")
         
         # Filtrer les données pour les classes cibles
         def filter_classes(example):
@@ -734,8 +394,8 @@ class CatastrophicForgettingEvaluator:
             print(f"  Époque {epoch+1}/{epochs}, Loss moyenne: {epoch_loss/num_batches:.4f}")
     
     def evaluate_after_training(self, dataset):
-        """Évaluation après fine-tuning"""
-        print("📈 Évaluation après fine-tuning...")
+        """Évaluation après fine-tuning standard"""
+        print("📈 Évaluation après fine-tuning standard...")
         
         test_data = dataset['test'].select(range(min(1000, len(dataset['test']))))
         dataloader = DataLoader(test_data, batch_size=8, shuffle=False, collate_fn=custom_collate_fn)
@@ -753,11 +413,24 @@ class CatastrophicForgettingEvaluator:
         
         return self.after_training_performance
     
-    def compute_fisher_information(self, dataset, sample_size=200):
-        """Calcule la Fisher Information Matrix pour EWC"""
-        print("🧮 Calcul de la Fisher Information Matrix...")
+    def prepare_continual_learning(self, dataset, method='ewc', sample_size=200):
+        """Préparer les données nécessaires pour l'apprentissage continu"""
+        print(f"🧠 Préparation pour l'apprentissage continu: {method.upper()}")
         
-        # Prendre un échantillon pour le calcul
+        self.continual_method = method
+        
+        if method == 'ewc':
+            self.compute_fisher_information(dataset, sample_size)
+        elif method == 'lwf':
+            self.compute_teacher_logits(dataset, sample_size)
+        elif method == 'mas':
+            self.compute_mas_importance(dataset, sample_size)
+        
+    def compute_fisher_information(self, dataset, sample_size=200):
+        """Calcule la Fisher Information Matrix pour EWC (version améliorée)"""
+        print("🧮 Calcul de la Fisher Information Matrix (EWC)...")
+        
+        # Prendre un échantillon équilibré pour le calcul
         sample_data = dataset['train'].select(range(min(sample_size, len(dataset['train']))))
         dataloader = DataLoader(sample_data, batch_size=4, shuffle=True, collate_fn=custom_collate_fn)
         
@@ -770,20 +443,18 @@ class CatastrophicForgettingEvaluator:
             if param.requires_grad:
                 self.optimal_params[name] = param.data.clone().detach()
         
-        print(f"📋 Paramètres sauvegardés: {len(self.optimal_params)} layers")
-        
-        # Calculer Fisher Information
+        # Initialiser Fisher Information
         self.fisher_information = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.fisher_information[name] = torch.zeros_like(param.data).to(DEVICE)
         
         criterion = nn.CrossEntropyLoss()
-        num_samples = 0
-        total_batches = 0
+        total_samples = 0
         
+        # Calculer Fisher Information avec plusieurs passes
         for batch_idx, batch in enumerate(dataloader):
-            if batch_idx >= 50:  # Limiter pour la vitesse
+            if batch_idx >= 50:
                 break
                 
             images = batch['image']
@@ -793,59 +464,140 @@ class CatastrophicForgettingEvaluator:
             inputs = self.processor(images, return_tensors="pt")
             inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
             
-            self.model.zero_grad()
-            outputs = self.model(**inputs)
-            loss = criterion(outputs.logits, labels)
-            loss.backward()
-            
-            # Accumuler Fisher Information (gradient^2)
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    self.fisher_information[name] += param.grad.data ** 2
-            
-            num_samples += len(labels)
-            total_batches += 1
+            # Calculer gradients pour chaque échantillon
+            for i in range(len(labels)):
+                self.model.zero_grad()
+                single_input = {k: v[i:i+1] for k, v in inputs.items()}
+                single_label = labels[i:i+1]
+                
+                outputs = self.model(**single_input)
+                loss = criterion(outputs.logits, single_label)
+                loss.backward()
+                
+                # Accumuler Fisher Information (gradient^2)
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        self.fisher_information[name] += param.grad.data ** 2
+                
+                total_samples += 1
         
-        # Normaliser par le nombre de batches (pas d'échantillons pour éviter des valeurs trop petites)
+        # Normaliser par le nombre d'échantillons
         for name in self.fisher_information:
-            self.fisher_information[name] /= total_batches
+            self.fisher_information[name] /= total_samples
+            # Ajouter une petite constante pour éviter les zéros
+            self.fisher_information[name] += 1e-8
         
-        # Vérifier que la Fisher Information n'est pas nulle et normaliser si nécessaire
-        fisher_stats = {}
-        for name, fisher in self.fisher_information.items():
-            fisher_mean = fisher.mean().item()
-            fisher_max = fisher.max().item()
-            fisher_min = fisher.min().item()
-            fisher_std = fisher.std().item()
-            fisher_stats[name] = {'mean': fisher_mean, 'max': fisher_max, 'min': fisher_min, 'std': fisher_std}
+        print(f"✅ Fisher Information calculée sur {total_samples} échantillons")
         
-        print(f"✅ Fisher Information calculée sur {num_samples} échantillons, {total_batches} batches")
-        print(f"📊 Stats Fisher (quelques layers):")
-        for i, (name, stats) in enumerate(list(fisher_stats.items())[:3]):
-            print(f"  {name}: mean={stats['mean']:.8f}, max={stats['max']:.8f}, std={stats['std']:.8f}")
+    def compute_teacher_logits(self, dataset, sample_size=200):
+        """Calcule les logits du modèle baseline pour LwF"""
+        print("🎓 Calcul des logits du modèle teacher (LwF)...")
         
-        # Appliquer une normalisation et ajouter un minimum pour éviter les zeros
-        total_fisher_sum = 0
-        for name, fisher in self.fisher_information.items():
-            # Normaliser pour éviter des valeurs extrêmement petites
-            if fisher.max() > 0:
-                self.fisher_information[name] = fisher / fisher.max() * 1e-4
-            self.fisher_information[name] += 1e-6  # Valeur minimum
-            total_fisher_sum += self.fisher_information[name].sum().item()
+        # Utiliser le modèle baseline comme teacher
+        teacher_model = copy.deepcopy(self.original_model)
+        teacher_model.eval()
+        teacher_model.to(DEVICE)
         
-        print(f"📈 Total Fisher sum après normalisation: {total_fisher_sum:.6f}")
+        # Prendre un échantillon pour calculer les logits
+        sample_data = dataset['train'].select(range(min(sample_size, len(dataset['train']))))
+        dataloader = DataLoader(sample_data, batch_size=8, shuffle=False, collate_fn=custom_collate_fn)
+        
+        self.teacher_logits = {}
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                images = batch['image']
+                labels = batch['label']
+                images = ensure_rgb_images(images)
+                
+                inputs = self.processor(images, return_tensors="pt")
+                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                
+                outputs = teacher_model(**inputs)
+                
+                # Stocker les logits pour chaque échantillon
+                for i, label in enumerate(labels):
+                    sample_idx = batch_idx * 8 + i
+                    self.teacher_logits[sample_idx] = outputs.logits[i].cpu().detach()
+        
+        print(f"✅ Logits teacher calculés pour {len(self.teacher_logits)} échantillons")
+        
+    def compute_mas_importance(self, dataset, sample_size=200):
+        """Calcule l'importance des paramètres pour MAS (Memory Aware Synapses)"""
+        print("🧠 Calcul de l'importance MAS...")
+        
+        # Prendre un échantillon
+        sample_data = dataset['train'].select(range(min(sample_size, len(dataset['train']))))
+        dataloader = DataLoader(sample_data, batch_size=4, shuffle=True, collate_fn=custom_collate_fn)
+        
+        self.model.eval()
+        self.model.to(DEVICE)
+        
+        # Sauvegarder les paramètres optimaux
+        self.optimal_params = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.optimal_params[name] = param.data.clone().detach()
+        
+        # Initialiser l'importance MAS
+        self.mas_importance = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.mas_importance[name] = torch.zeros_like(param.data).to(DEVICE)
+        
+        total_samples = 0
+        
+        # Calculer l'importance basée sur les gradients de l'output
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= 50:
+                break
+                
+            images = batch['image']
+            labels = torch.tensor(batch['label'], dtype=torch.long).to(DEVICE)
+            images = ensure_rgb_images(images)
+            
+            inputs = self.processor(images, return_tensors="pt")
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+            
+            # Calculer gradients pour chaque échantillon
+            for i in range(len(labels)):
+                self.model.zero_grad()
+                single_input = {k: v[i:i+1] for k, v in inputs.items()}
+                
+                outputs = self.model(**single_input)
+                # Utiliser la norme L2 de l'output au lieu de la loss
+                l2_norm = torch.norm(outputs.logits, p=2)
+                l2_norm.backward()
+                
+                # Accumuler l'importance (gradient absolu)
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        self.mas_importance[name] += param.grad.data.abs()
+                
+                total_samples += 1
+        
+        # Normaliser
+        for name in self.mas_importance:
+            self.mas_importance[name] /= total_samples
+            self.mas_importance[name] += 1e-8
+        
+        print(f"✅ Importance MAS calculée sur {total_samples} échantillons")
     
-    def fine_tune_with_ewc(self, dataset, target_classes, epochs=3, ewc_lambda=1000):
-        """Fine-tune avec Elastic Weight Consolidation"""
-        print(f"🧠 Fine-tuning avec EWC (λ={ewc_lambda}) sur les classes: {target_classes}")
+    def fine_tune_with_continual_learning(self, dataset, target_classes, epochs=3, 
+                                        method='ewc', reg_lambda=1000):
+        """Fine-tune avec techniques d'apprentissage continu"""
         
-        # Vérifier que Fisher Information et optimal params sont disponibles
-        if not self.fisher_information or not self.optimal_params:
-            print("❌ Erreur: Fisher Information ou paramètres optimaux manquants!")
-            return
-        
-        print(f"📋 Fisher Information disponible pour {len(self.fisher_information)} paramètres")
-        print(f"📋 Paramètres optimaux disponibles pour {len(self.optimal_params)} paramètres")
+        # Définir la lambda selon la méthode
+        if method == 'ewc':
+            effective_lambda = reg_lambda
+        elif method == 'lwf':
+            effective_lambda = 0.5  # Lambda fixe pour LwF
+        elif method == 'mas':
+            effective_lambda = 1.0  # Lambda fixe pour MAS
+        else:
+            effective_lambda = 0.0
+            
+        print(f"🧠 Fine-tuning avec {method.upper()} (λ={effective_lambda}) sur les classes: {target_classes}")
         
         # Filtrer les données pour les classes cibles
         def filter_classes(example):
@@ -864,10 +616,10 @@ class CatastrophicForgettingEvaluator:
         
         for epoch in range(epochs):
             epoch_loss = 0
-            epoch_ewc_loss = 0
+            epoch_reg_loss = 0
             num_batches = 0
             
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
                 images = batch['image']
                 labels = torch.tensor(batch['label'], dtype=torch.long).to(DEVICE)
                 images = ensure_rgb_images(images)
@@ -880,46 +632,85 @@ class CatastrophicForgettingEvaluator:
                 # Loss standard
                 standard_loss = base_criterion(outputs.logits, labels)
                 
-                # Loss EWC (régularisation)
-                ewc_loss = torch.tensor(0.0, device=DEVICE, requires_grad=True)
-                ewc_components = 0
-                
-                for name, param in self.model.named_parameters():
-                    if name in self.fisher_information and name in self.optimal_params and param.requires_grad:
-                        fisher = self.fisher_information[name].to(DEVICE)
-                        optimal = self.optimal_params[name].to(DEVICE)
-                        
-                        # Calcul de la pénalité EWC pour ce paramètre
-                        param_penalty = (fisher * (param - optimal) ** 2).sum()
-                        ewc_loss = ewc_loss + param_penalty
-                        ewc_components += 1
-                
-                # Debug pour la première époque, premier batch
-                if epoch == 0 and num_batches == 0:
-                    print(f"🔍 Debug EWC - Composants traités: {ewc_components}")
-                    print(f"🔍 Debug EWC - Loss brut: {ewc_loss.item():.8f}")
-                    print(f"🔍 Debug EWC - Lambda: {ewc_lambda}")
-                    print(f"🔍 Debug EWC - Loss pondéré: {ewc_lambda * ewc_loss.item():.8f}")
+                # Loss de régularisation selon la méthode
+                if method == 'ewc':
+                    reg_loss = self._compute_ewc_loss()
+                elif method == 'lwf':
+                    reg_loss = self._compute_lwf_loss(outputs.logits, batch_idx)
+                elif method == 'mas':
+                    reg_loss = self._compute_mas_loss()
+                else:
+                    reg_loss = torch.tensor(0.0, device=DEVICE)
                 
                 # Loss totale
-                total_loss = standard_loss + ewc_lambda * ewc_loss
+                total_loss = standard_loss + effective_lambda * reg_loss
                 
                 optimizer.zero_grad()
                 total_loss.backward()
                 optimizer.step()
                 
                 epoch_loss += standard_loss.item()
-                epoch_ewc_loss += ewc_loss.item()
+                epoch_reg_loss += reg_loss.item()
                 num_batches += 1
             
             avg_standard_loss = epoch_loss / num_batches
-            avg_ewc_loss = epoch_ewc_loss / num_batches
-            avg_ewc_weighted = avg_ewc_loss * ewc_lambda
-            print(f"  Époque {epoch+1}/{epochs}, Loss standard: {avg_standard_loss:.4f}, Loss EWC: {avg_ewc_loss:.6f}, EWC pondéré: {avg_ewc_weighted:.4f}")
+            avg_reg_loss = epoch_reg_loss / num_batches
+            print(f"  Époque {epoch+1}/{epochs}, Loss standard: {avg_standard_loss:.4f}, "
+                  f"Loss {method.upper()}: {avg_reg_loss:.6f}")
     
-    def evaluate_ewc_performance(self, dataset):
-        """Évaluation après fine-tuning avec EWC"""
-        print("📈 Évaluation après fine-tuning EWC...")
+    def _compute_ewc_loss(self):
+        """Calcule la perte EWC"""
+        ewc_loss = torch.tensor(0.0, device=DEVICE)
+        
+        for name, param in self.model.named_parameters():
+            if name in self.fisher_information and name in self.optimal_params and param.requires_grad:
+                fisher = self.fisher_information[name].to(DEVICE)
+                optimal = self.optimal_params[name].to(DEVICE)
+                ewc_loss += (fisher * (param - optimal) ** 2).sum()
+        
+        return ewc_loss
+    
+    def _compute_lwf_loss(self, student_logits, batch_idx):
+        """Calcule la perte LwF (Learning without Forgetting)"""
+        lwf_loss = torch.tensor(0.0, device=DEVICE)
+        
+        # Utiliser les logits du teacher stockés pour la distillation
+        if hasattr(self, 'teacher_logits') and self.teacher_logits:
+            temperature = 4.0
+            kl_loss = nn.KLDivLoss(reduction='batchmean')
+            
+            # Utiliser les logits du teacher stockés
+            batch_size = student_logits.size(0)
+            start_idx = batch_idx * batch_size
+            end_idx = start_idx + batch_size
+            
+            # Vérifier si on a assez de teacher logits
+            if end_idx <= len(self.teacher_logits):
+                teacher_batch_logits = self.teacher_logits[start_idx:end_idx].to(DEVICE)
+                
+                # Distillation avec température
+                student_soft = F.log_softmax(student_logits / temperature, dim=1)
+                teacher_soft = F.softmax(teacher_batch_logits / temperature, dim=1)
+                
+                lwf_loss = kl_loss(student_soft, teacher_soft) * (temperature ** 2)
+        
+        return lwf_loss
+    
+    def _compute_mas_loss(self):
+        """Calcule la perte MAS"""
+        mas_loss = torch.tensor(0.0, device=DEVICE)
+        
+        for name, param in self.model.named_parameters():
+            if name in self.mas_importance and name in self.optimal_params and param.requires_grad:
+                importance = self.mas_importance[name].to(DEVICE)
+                optimal = self.optimal_params[name].to(DEVICE)
+                mas_loss += (importance * (param - optimal) ** 2).sum()
+        
+        return mas_loss
+    
+    def evaluate_continual_performance(self, dataset):
+        """Évaluation après fine-tuning avec apprentissage continu"""
+        print(f"📈 Évaluation après fine-tuning avec {self.continual_method.upper()}...")
         
         test_data = dataset['test'].select(range(min(1000, len(dataset['test']))))
         dataloader = DataLoader(test_data, batch_size=8, shuffle=False, collate_fn=custom_collate_fn)
@@ -930,15 +721,15 @@ class CatastrophicForgettingEvaluator:
         # Performance par classe
         class_performance = self.evaluate_per_class(dataloader)
         
-        self.ewc_performance = {
+        self.continual_performance = {
             'global': {'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1},
             'per_class': class_performance
         }
         
-        return self.ewc_performance
+        return self.continual_performance
     
-    def calculate_forgetting(self, target_classes, include_ewc=False):
-        """Calcul de l'oubli catastrophique réel"""
+    def calculate_forgetting(self, target_classes, include_continual=False):
+        """Calcul de l'oubli catastrophique"""
         if not self.baseline_performance or not self.after_training_performance:
             return None
             
@@ -949,10 +740,11 @@ class CatastrophicForgettingEvaluator:
             )
         }
         
-        # Résultats EWC si disponibles
-        if include_ewc and self.ewc_performance:
-            results['ewc'] = self._calculate_forgetting_for_method(
-                self.baseline_performance, self.ewc_performance, target_classes, 'EWC'
+        # Résultats avec apprentissage continu si disponibles
+        if include_continual and self.continual_performance:
+            method_name = f"{self.continual_method.upper()}" if self.continual_method else "Continual"
+            results['continual'] = self._calculate_forgetting_for_method(
+                self.baseline_performance, self.continual_performance, target_classes, method_name
             )
         
         return results
@@ -995,8 +787,8 @@ class CatastrophicForgettingEvaluator:
             'target_classes': target_classes
         }
 
-def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_epochs, use_ewc, ewc_lambda):
-    """Évaluation réelle de l'oubli catastrophique"""
+def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_epochs, continual_method, reg_lambda):
+    """Évaluation de l'oubli catastrophique"""
     try:
         # Parse les classes cibles
         target_classes = [int(x.strip()) for x in target_classes_str.split(',') if x.strip().isdigit()]
@@ -1028,27 +820,31 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         evaluator.fine_tune_on_subset(dataset, target_classes, epochs=fine_tuning_epochs)
         after_training = evaluator.evaluate_after_training(dataset)
         
-        # 4. EWC si demandé
-        ewc_results = None
-        if use_ewc:
-            print("\n🧠 === CALCUL FISHER INFORMATION ===")
-            # Restaurer le modèle original pour calculer Fisher Information
+        # 4. Fine-tuning avec apprentissage continu si demandé
+        continual_results = None
+        if continual_method != 'none':
+            print(f"\n🧠 === FINE-TUNING AVEC {continual_method.upper()} ===")
+            # Restaurer le modèle original
             evaluator.model = copy.deepcopy(original_model)
-            evaluator.compute_fisher_information(dataset)
             
-            print("\n🔧 === FINE-TUNING AVEC EWC ===")
-            # Fine-tuning avec EWC
-            evaluator.fine_tune_with_ewc(dataset, target_classes, epochs=fine_tuning_epochs, ewc_lambda=ewc_lambda)
-            ewc_results = evaluator.evaluate_ewc_performance(dataset)
+            # Préparer les données nécessaires pour l'apprentissage continu
+            evaluator.prepare_continual_learning(dataset, method=continual_method)
+            
+            # Fine-tuning avec la méthode d'apprentissage continu
+            evaluator.fine_tune_with_continual_learning(
+                dataset, target_classes, epochs=fine_tuning_epochs, 
+                method=continual_method, reg_lambda=reg_lambda
+            )
+            continual_results = evaluator.evaluate_continual_performance(dataset)
         
-        # 4. Calcul de l'oubli catastrophique
-        forgetting_analysis = evaluator.calculate_forgetting(target_classes, include_ewc=use_ewc)
+        # 5. Calcul de l'oubli catastrophique
+        forgetting_analysis = evaluator.calculate_forgetting(target_classes, include_continual=(continual_method != 'none'))
         
         # Création des graphiques
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        title = '🧠 Analyse Réelle de l\'Oubli Catastrophique'
-        if use_ewc:
-            title += ' - Comparaison Standard vs EWC'
+        title = '🧠 Analyse de l\'Oubli Catastrophique'
+        if continual_method != 'none':
+            title += f' - Comparaison Standard vs {continual_method.upper()}'
         fig.suptitle(title, fontsize=16, fontweight='bold')
         
         # Préparation des données
@@ -1061,23 +857,23 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         
         x = np.arange(len(metrics))
         
-        if use_ewc and ewc_results:
-            # Comparaison à 3 barres : Baseline, Standard, EWC
-            ewc_values = [ewc_results['global'][m] for m in metrics]
+        if continual_method != 'none' and continual_results:
+            # Comparaison à 3 barres : Baseline, Standard, Méthode Continue
+            continual_values = [continual_results['global'][m] for m in metrics]
             width = 0.25
             
             bars1 = axes[0,0].bar(x - width, baseline_values, width, label='Baseline', color='skyblue', alpha=0.8)
             bars2 = axes[0,0].bar(x, after_values, width, label='Fine-tuning Standard', color='lightcoral', alpha=0.8)
-            bars3 = axes[0,0].bar(x + width, ewc_values, width, label='Fine-tuning EWC', color='lightgreen', alpha=0.8)
+            bars3 = axes[0,0].bar(x + width, continual_values, width, label=f'Fine-tuning {continual_method.upper()}', color='lightgreen', alpha=0.8)
             
             # Annotations pour 3 barres
-            for i, (bar1, bar2, bar3, base_val, std_val, ewc_val) in enumerate(zip(bars1, bars2, bars3, baseline_values, after_values, ewc_values)):
+            for i, (bar1, bar2, bar3, base_val, std_val, cont_val) in enumerate(zip(bars1, bars2, bars3, baseline_values, after_values, continual_values)):
                 axes[0,0].text(bar1.get_x() + bar1.get_width()/2, bar1.get_height() + 0.01, 
                               f'{base_val:.3f}', ha='center', va='bottom', fontsize=8)
                 axes[0,0].text(bar2.get_x() + bar2.get_width()/2, bar2.get_height() + 0.01, 
                               f'{std_val:.3f}', ha='center', va='bottom', fontsize=8)
                 axes[0,0].text(bar3.get_x() + bar3.get_width()/2, bar3.get_height() + 0.01, 
-                              f'{ewc_val:.3f}', ha='center', va='bottom', fontsize=8)
+                              f'{cont_val:.3f}', ha='center', va='bottom', fontsize=8)
         else:
             # Comparaison standard à 2 barres
             width = 0.35
@@ -1101,16 +897,16 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         axes[0,0].set_ylim([0, 1])
         
         # Graphique 2: Comparaison de l'oubli catastrophique
-        if use_ewc and 'ewc' in forgetting_analysis:
-            # Comparaison Standard vs EWC
-            methods = ['Standard', 'EWC']
+        if continual_method != 'none' and 'continual' in forgetting_analysis:
+            # Comparaison Standard vs Méthode Continue
+            methods = ['Standard', continual_method.upper()]
             global_forgetting_values = [
                 forgetting_analysis['standard']['global_forgetting'],
-                forgetting_analysis['ewc']['global_forgetting']
+                forgetting_analysis['continual']['global_forgetting']
             ]
             avg_forgetting_values = [
                 forgetting_analysis['standard']['avg_forgetting_preserved_classes'],
-                forgetting_analysis['ewc']['avg_forgetting_preserved_classes']
+                forgetting_analysis['continual']['avg_forgetting_preserved_classes']
             ]
             
             x = np.arange(len(methods))
@@ -1169,25 +965,25 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         baseline_class_acc = [baseline['per_class'].get(i, 0) for i in class_ids]
         after_class_acc = [after_training['per_class'].get(i, 0) for i in class_ids]
         
-        if use_ewc and ewc_results:
-            # Comparaison des changements : Standard vs EWC
-            ewc_class_acc = [ewc_results['per_class'].get(i, 0) for i in class_ids]
+        if continual_method != 'none' and continual_results:
+            # Comparaison des changements : Standard vs Méthode Continue
+            continual_class_acc = [continual_results['per_class'].get(i, 0) for i in class_ids]
             
             # Calcul des changements
             standard_changes = [after - baseline for after, baseline in zip(after_class_acc, baseline_class_acc)]
-            ewc_changes = [ewc - baseline for ewc, baseline in zip(ewc_class_acc, baseline_class_acc)]
+            continual_changes = [continual - baseline for continual, baseline in zip(continual_class_acc, baseline_class_acc)]
             
             x = np.arange(len(class_ids))
             width = 0.35
             
             # Couleurs basées sur positif/négatif
             standard_colors = ['green' if change >= 0 else 'red' for change in standard_changes]
-            ewc_colors = ['darkgreen' if change >= 0 else 'darkred' for change in ewc_changes]
+            continual_colors = ['darkgreen' if change >= 0 else 'darkred' for change in continual_changes]
             
             bars1 = axes[1,0].bar(x - width/2, standard_changes, width, label='Changement Standard', 
                                  color=standard_colors, alpha=0.8)
-            bars2 = axes[1,0].bar(x + width/2, ewc_changes, width, label='Changement EWC', 
-                                 color=ewc_colors, alpha=0.8)
+            bars2 = axes[1,0].bar(x + width/2, continual_changes, width, label=f'Changement {continual_method.upper()}', 
+                                 color=continual_colors, alpha=0.8)
             
             # Marquer les classes cibles avec des lignes verticales
             for i, class_id in enumerate(class_ids):
@@ -1195,14 +991,14 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
                     axes[1,0].axvline(x=i, color='blue', linestyle=':', alpha=0.6, linewidth=2)
             
             # Annotations pour les changements significatifs
-            for i, (std_change, ewc_change) in enumerate(zip(standard_changes, ewc_changes)):
+            for i, (std_change, cont_change) in enumerate(zip(standard_changes, continual_changes)):
                 if abs(std_change) > 0.05:  # Changement significatif
                     axes[1,0].text(i - width/2, std_change + (0.01 if std_change >= 0 else -0.02), 
                                   f'{std_change:+.2f}', ha='center', va='bottom' if std_change >= 0 else 'top', 
                                   fontsize=8, fontweight='bold')
-                if abs(ewc_change) > 0.05:  # Changement significatif
-                    axes[1,0].text(i + width/2, ewc_change + (0.01 if ewc_change >= 0 else -0.02), 
-                                  f'{ewc_change:+.2f}', ha='center', va='bottom' if ewc_change >= 0 else 'top', 
+                if abs(cont_change) > 0.05:  # Changement significatif
+                    axes[1,0].text(i + width/2, cont_change + (0.01 if cont_change >= 0 else -0.02), 
+                                  f'{cont_change:+.2f}', ha='center', va='bottom' if cont_change >= 0 else 'top', 
                                   fontsize=8, fontweight='bold')
             
         else:
@@ -1244,24 +1040,24 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         axes[1,0].axhline(y=0, color='black', linestyle='--', alpha=0.5)  # Ligne de référence à 0
         
         # Limites dynamiques basées sur les données
-        all_changes = performance_changes if not (use_ewc and ewc_results) else standard_changes + ewc_changes
+        all_changes = performance_changes if not (continual_method != 'none' and continual_results) else standard_changes + continual_changes
         y_max = max(0.1, max(all_changes) * 1.2) if all_changes else 0.1
         y_min = min(-0.1, min(all_changes) * 1.2) if all_changes else -0.1
         axes[1,0].set_ylim([y_min, y_max])
         
         # Graphique 4: Résumé des métriques clés
-        if use_ewc and 'ewc' in forgetting_analysis:
-            # Comparaison Standard vs EWC sur métriques clés
+        if continual_method != 'none' and 'continual' in forgetting_analysis:
+            # Comparaison Standard vs Méthode Continue sur métriques clés
             metrics_names = ['Oubli Global', 'Oubli Classes\nPréservées', 'Amélioration\nClasses Cibles']
             standard_metrics = [
                 standard_results['global_forgetting'],
                 standard_results['avg_forgetting_preserved_classes'],
                 standard_results['avg_improvement_target_classes']
             ]
-            ewc_metrics = [
-                forgetting_analysis['ewc']['global_forgetting'],
-                forgetting_analysis['ewc']['avg_forgetting_preserved_classes'],
-                forgetting_analysis['ewc']['avg_improvement_target_classes']
+            continual_metrics = [
+                forgetting_analysis['continual']['global_forgetting'],
+                forgetting_analysis['continual']['avg_forgetting_preserved_classes'],
+                forgetting_analysis['continual']['avg_improvement_target_classes']
             ]
             
             x = np.arange(len(metrics_names))
@@ -1269,12 +1065,12 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
             
             bars1 = axes[1,1].bar(x - width/2, standard_metrics, width, label='Standard', 
                                  color=['red', 'orange', 'blue'], alpha=0.8)
-            bars2 = axes[1,1].bar(x + width/2, ewc_metrics, width, label='EWC', 
+            bars2 = axes[1,1].bar(x + width/2, continual_metrics, width, label=continual_method.upper(), 
                                  color=['darkred', 'darkorange', 'darkblue'], alpha=0.8)
             
             axes[1,1].set_xlabel('Métriques')
             axes[1,1].set_ylabel('Score')
-            axes[1,1].set_title('📈 Comparaison Standard vs EWC')
+            axes[1,1].set_title(f'📈 Comparaison Standard vs {continual_method.upper()}')
             axes[1,1].set_xticks(x)
             axes[1,1].set_xticklabels(metrics_names)
             axes[1,1].legend()
@@ -1285,7 +1081,7 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
             for bar, value in zip(bars1, standard_metrics):
                 axes[1,1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005 if value >= 0 else bar.get_height() - 0.01, 
                               f'{value:.3f}', ha='center', va='bottom' if value >= 0 else 'top', fontsize=8)
-            for bar, value in zip(bars2, ewc_metrics):
+            for bar, value in zip(bars2, continual_metrics):
                 axes[1,1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005 if value >= 0 else bar.get_height() - 0.01, 
                               f'{value:.3f}', ha='center', va='bottom' if value >= 0 else 'top', fontsize=8)
         else:
@@ -1329,8 +1125,8 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
 • Classes cibles pour fine-tuning: {target_classes} ({', '.join(target_names)})
 • Classes à préserver: {len(preserved_classes)} autres classes
 • Époques de fine-tuning: {fine_tuning_epochs}
-• EWC activé: {'✅ Oui' if use_ewc else '❌ Non'}
-{f'• Lambda EWC: {ewc_lambda}' if use_ewc else ''}
+• Méthode d'apprentissage continu: {continual_method.upper() if continual_method != 'none' else 'Aucune'}
+{f'• Lambda régularisation: {reg_lambda}' if continual_method != 'none' else ''}
 
 📊 RÉSULTATS BASELINE (avant fine-tuning):
 • Accuracy globale: {baseline['global']['accuracy']:.4f}
@@ -1350,24 +1146,24 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
 • Amélioration moyenne (classes cibles): {standard_results['avg_improvement_target_classes']:.4f}
 """
 
-        if use_ewc and ewc_results:
-            ewc_results_data = forgetting_analysis['ewc']
+        if continual_method != 'none' and continual_results:
+            continual_results_data = forgetting_analysis['continual']
             report += f"""
-🧠 RÉSULTATS AVEC EWC:
-• Accuracy globale: {ewc_results['global']['accuracy']:.4f}
-• Precision: {ewc_results['global']['precision']:.4f}
-• Recall: {ewc_results['global']['recall']:.4f}
-• F1-Score: {ewc_results['global']['f1']:.4f}
+🧠 RÉSULTATS AVEC {continual_method.upper()}:
+• Accuracy globale: {continual_results['global']['accuracy']:.4f}
+• Precision: {continual_results['global']['precision']:.4f}
+• Recall: {continual_results['global']['recall']:.4f}
+• F1-Score: {continual_results['global']['f1']:.4f}
 
-🔻 OUBLI CATASTROPHIQUE (EWC):
-• Oubli global: {ewc_results_data['global_forgetting']:.4f} ({ewc_results_data['global_forgetting']*100:+.2f}%)
-• Oubli moyen (classes préservées): {ewc_results_data['avg_forgetting_preserved_classes']:.4f}
-• Amélioration moyenne (classes cibles): {ewc_results_data['avg_improvement_target_classes']:.4f}
+🔻 OUBLI CATASTROPHIQUE ({continual_method.upper()}):
+• Oubli global: {continual_results_data['global_forgetting']:.4f} ({continual_results_data['global_forgetting']*100:+.2f}%)
+• Oubli moyen (classes préservées): {continual_results_data['avg_forgetting_preserved_classes']:.4f}
+• Amélioration moyenne (classes cibles): {continual_results_data['avg_improvement_target_classes']:.4f}
 
-⚖️ COMPARAISON EWC vs STANDARD:
-• Réduction d'oubli global: {(standard_results['global_forgetting'] - ewc_results_data['global_forgetting'])*100:+.2f}%
-• Réduction d'oubli (classes préservées): {(standard_results['avg_forgetting_preserved_classes'] - ewc_results_data['avg_forgetting_preserved_classes'])*100:+.2f}%
-• Différence amélioration cibles: {(ewc_results_data['avg_improvement_target_classes'] - standard_results['avg_improvement_target_classes'])*100:+.2f}%
+⚖️ COMPARAISON {continual_method.upper()} vs STANDARD:
+• Réduction d'oubli global: {(standard_results['global_forgetting'] - continual_results_data['global_forgetting'])*100:+.2f}%
+• Réduction d'oubli (classes préservées): {(standard_results['avg_forgetting_preserved_classes'] - continual_results_data['avg_forgetting_preserved_classes'])*100:+.2f}%
+• Différence amélioration cibles: {(continual_results_data['avg_improvement_target_classes'] - standard_results['avg_improvement_target_classes'])*100:+.2f}%
 """
 
         report += "\n🏆 INTERPRÉTATION:\n"
@@ -1380,14 +1176,14 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         else:
             report += "✅ Oubli minimal (Standard)! Le modèle a bien préservé ses connaissances.\n"
         
-        # Analyse EWC si disponible
-        if use_ewc and 'ewc' in forgetting_analysis:
-            ewc_data = forgetting_analysis['ewc']
-            if ewc_data['global_forgetting'] < standard_results['global_forgetting']:
-                reduction = ((standard_results['global_forgetting'] - ewc_data['global_forgetting']) / standard_results['global_forgetting']) * 100
-                report += f"🎉 EWC EFFICACE! Réduction de l'oubli de {reduction:.1f}%\n"
+        # Analyse de la méthode d'apprentissage continu si disponible
+        if continual_method != 'none' and 'continual' in forgetting_analysis:
+            continual_data = forgetting_analysis['continual']
+            if continual_data['global_forgetting'] < standard_results['global_forgetting']:
+                reduction = ((standard_results['global_forgetting'] - continual_data['global_forgetting']) / standard_results['global_forgetting']) * 100
+                report += f"🎉 {continual_method.upper()} EFFICACE! Réduction de l'oubli de {reduction:.1f}%\n"
             else:
-                report += "⚠️ EWC n'a pas réduit l'oubli. Essayez d'ajuster lambda ou plus d'époques baseline.\n"
+                report += f"⚠️ {continual_method.upper()} n'a pas réduit l'oubli. Essayez d'ajuster lambda ou plus d'époques baseline.\n"
         
         if standard_results['avg_improvement_target_classes'] > 0.05:
             report += "🎯 Amélioration significative sur les classes cibles!\n"
@@ -1407,13 +1203,13 @@ def run_real_catastrophic_forgetting_evaluation(target_classes_str, fine_tuning_
         report += f"""
 💡 RECOMMANDATIONS:
 """
-        if use_ewc:
-            if 'ewc' in forgetting_analysis and forgetting_analysis['ewc']['global_forgetting'] < standard_results['global_forgetting']:
-                report += "✅ EWC fonctionne bien! Continuez avec cette approche.\n"
+        if continual_method != 'none':
+            if 'continual' in forgetting_analysis and forgetting_analysis['continual']['global_forgetting'] < standard_results['global_forgetting']:
+                report += f"✅ {continual_method.upper()} fonctionne bien! Continuez avec cette approche.\n"
             else:
-                report += "🔧 Ajustez lambda EWC (essayez des valeurs plus élevées: 5000, 10000).\n"
+                report += f"🔧 Ajustez lambda {continual_method.upper()} (essayez des valeurs plus élevées: 5000, 10000).\n"
         else:
-            report += "🧠 Essayez EWC pour réduire l'oubli catastrophique.\n"
+            report += "🧠 Essayez une méthode d'apprentissage continu pour réduire l'oubli catastrophique.\n"
             
         report += """• Si oubli > 0.05: Utiliser des techniques de regularisation (EWC, LwF)
 • Si amélioration faible: Augmenter les époques ou ajuster le learning rate
@@ -1461,77 +1257,10 @@ def create_interface():
                     outputs=[comparison_report, performance_plot, efficiency_plot]
                 )
             
-            # Onglet 2: Apprentissage Continu
-            with gr.TabItem("🧠 Apprentissage Continu"):
+            # Onglet 2: Évaluation RÉELLE de l'Oubli Catastrophique
+            with gr.TabItem("🧠 Oubli Catastrophique"):
                 gr.Markdown("""
-                ### 🔬 Simulation d'Apprentissage Continu
-                
-                """)
-                
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("### ⚙️ Configuration")
-                        
-                        method_selection = gr.CheckboxGroup(
-                            choices=["Naive", "Rehearsal", "LwF (Learning without Forgetting)"],
-                            value=["Naive", "Rehearsal"],
-                            label="🎯 Méthodes à évaluer",
-                            info="Sélectionnez les méthodes d'apprentissage continu à comparer"
-                        )
-                        
-                        num_tasks_slider = gr.Slider(
-                            minimum=2, maximum=8, value=4, step=1,
-                            label="📚 Nombre de tâches",
-                            info="Nombre de tâches d'apprentissage séquentielles"
-                        )
-                        
-                        continual_btn = gr.Button(
-                            "🚀 Démarrer l'Expérience", 
-                            variant="primary", 
-                            size="lg"
-                        )
-                        
-                        gr.Markdown("""
-                        **📋 Méthodes simulées:**
-                        - **Naive**: Apprentissage séquentiel simple (oubli total)
-                        - **Rehearsal**: Mélange basique avec 25% d'anciennes données
-                        - **LwF**: Moins d'époques (simulation très simplifiée)
-                        
-                        **⚠️ Ces implémentations sont des démonstrations de concepts, pas des méthodes complètes de continual learning.**
-                        """)
-                    
-                    with gr.Column(scale=2):
-                        continual_plot = gr.Plot(
-                            label="📊 Résultats de l'Apprentissage Continu",
-                            visible=True
-                        )
-                
-                with gr.Row():
-                    continual_report = gr.Textbox(
-                        label="📋 Analyse des Résultats",
-                        lines=15,
-                        placeholder="Configurez l'expérience et cliquez sur 'Démarrer' pour voir les résultats...",
-                        visible=True
-                    )
-                
-                continual_btn.click(
-                    run_continual_learning_experiment,
-                    inputs=[method_selection, num_tasks_slider],
-                    outputs=[continual_report, continual_plot]
-                )
-            
-            # Onglet 3: Évaluation RÉELLE de l'Oubli Catastrophique
-            with gr.TabItem("🧠 Oubli Catastrophique RÉEL"):
-                gr.Markdown("""
-                ### 🔬 Évaluation Réelle de l'Oubli Catastrophique
-                **🎯 Analyse concrète :** Mesurez l'oubli catastrophique réel du modèle Student en le fine-tunant sur des classes spécifiques.
-                
-                **📋 Processus :**
-                1. Évaluation baseline du modèle sur toutes les classes
-                2. Fine-tuning sur les classes que vous sélectionnez  
-                3. Re-évaluation et calcul de l'oubli catastrophique
-                4. Analyse détaillée par classe et recommandations
-                """)
+                ### 🔬 Évaluation de l'Oubli Catastrophique""")
                 
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1550,15 +1279,21 @@ def create_interface():
                             info="Plus d'époques = plus d'oubli potentiel mais meilleure performance sur les cibles"
                         )
                         
-                        use_ewc_checkbox = gr.Checkbox(
-                            label="🧠 Activer EWC (Elastic Weight Consolidation)",
-                            value=False,
-                            info="Compare fine-tuning standard vs EWC pour réduire l'oubli catastrophique"
+                        continual_method_dropdown = gr.Dropdown(
+                            choices=[
+                                ("Aucune méthode (fine-tuning standard seulement)", "none"),
+                                ("EWC - Elastic Weight Consolidation", "ewc"),
+                                ("LwF - Learning without Forgetting", "lwf"),
+                                ("MAS - Memory Aware Synapses", "mas")
+                            ],
+                            value="none",
+                            label="🧠 Méthode d'apprentissage continu",
+                            info="Choisir une technique pour réduire l'oubli catastrophique"
                         )
                         
-                        ewc_lambda_slider = gr.Slider(
+                        reg_lambda_slider = gr.Slider(
                             minimum=100, maximum=10000, value=1000, step=100,
-                            label="⚖️ Lambda EWC (force de régularisation)",
+                            label="⚖️ Lambda régularisation (force de régularisation)",
                             info="Plus élevé = moins d'oubli mais peut limiter l'apprentissage des nouvelles tâches",
                             visible=False
                         )
@@ -1569,14 +1304,14 @@ def create_interface():
                             size="lg"
                         )
                         
-                        # Afficher/masquer le slider lambda selon EWC
-                        def toggle_ewc_lambda(use_ewc):
-                            return gr.update(visible=use_ewc)
+                        # Afficher/masquer le slider lambda selon la méthode sélectionnée
+                        def toggle_lambda_slider(continual_method):
+                            return gr.update(visible=continual_method == "ewc")
                         
-                        use_ewc_checkbox.change(
-                            toggle_ewc_lambda,
-                            inputs=[use_ewc_checkbox],
-                            outputs=[ewc_lambda_slider]
+                        continual_method_dropdown.change(
+                            toggle_lambda_slider,
+                            inputs=[continual_method_dropdown],
+                            outputs=[reg_lambda_slider]
                         )
                         
                         gr.Markdown("""
@@ -1587,12 +1322,12 @@ def create_interface():
                         - 10: budget, 11: invoice, 12: presentation
                         - 13: questionnaire, 14: resume, 15: memo
                         
-                        **🧠 Elastic Weight Consolidation (EWC) :**
-                        - Technique avancée de continual learning
-                        - Utilise la Fisher Information Matrix pour préserver les poids importants
-                        - Lambda contrôle le trade-off entre nouvelle tâche et préservation
+                        **🧠 Méthodes d'apprentissage continu :**
+                        - **EWC** : Utilise la Fisher Information Matrix pour préserver les poids importants
+                        - **LwF** : Distillation de connaissances avec le modèle original comme teacher
+                        - **MAS** : Memory Aware Synapses basé sur l'importance des gradients
                         
-                        **⚠️ Note :** Cette évaluation prend 5-10 minutes (15-20 min avec EWC).
+                        **⚖️ Lambda** : Contrôle le trade-off entre nouvelle tâche et préservation (uniquement pour EWC)
                         """)
                     
                     with gr.Column(scale=2):
@@ -1611,16 +1346,16 @@ def create_interface():
                 
                 real_forgetting_btn.click(
                     run_real_catastrophic_forgetting_evaluation,
-                    inputs=[target_classes_input, epochs_slider, use_ewc_checkbox, ewc_lambda_slider],
+                    inputs=[target_classes_input, epochs_slider, continual_method_dropdown, reg_lambda_slider],
                     outputs=[real_forgetting_report, real_forgetting_plot]
                 )
             
-            # Onglet 4: Documentation
+            # Onglet 3: Documentation
             with gr.TabItem("📚 Documentation"):
                 gr.Markdown("""
                 ### 📖 Guide d'utilisation
                 
-                #### 🎯 Onglet Comparaison des Performances
+                #### 🎯 Onglet 1: Comparaison des Performances
                 - **Student Model**: HAMMALE/vit-tiny-classifier-rvlcdip (Vision Transformer compact)
                 - **Teacher Model**: microsoft/dit-large-finetuned-rvlcdip (Document Image Transformer)
                 - **Dataset**: HAMMALE/rvl_cdip_OCR (classification de documents)
@@ -1630,18 +1365,7 @@ def create_interface():
                 - Temps d'inférence et taille du modèle
                 - Ratio de compression et perte de performance
                 
-                #### 🧠 Onglet Apprentissage Continu (Simulation)
-                **⚠️ Simulation éducative** des concepts d'apprentissage continu :
-                - **Naive**: Apprentissage séquentiel simple
-                - **Rehearsal**: Mélange basique avec données précédentes  
-                - **LwF**: Simulation simplifiée de Learning without Forgetting
-                
-                **Métriques simulées:**
-                - Performance par tâche artificielle
-                - Score d'oubli approximatif
-                - Comparaison des approches conceptuelles
-                
-                #### 🔬 Onglet Oubli Catastrophique RÉEL
+                #### 🧠 Onglet 2: Oubli Catastrophique RÉEL
                 **🎯 Évaluation concrète** de l'oubli catastrophique du modèle Student :
                 
                 **Processus scientifique:**
@@ -1654,33 +1378,38 @@ def create_interface():
                 - Oubli global et par classe (avant/après fine-tuning)
                 - Performance différentielle sur classes cibles vs préservées
                 - Identification des classes les plus vulnérables
-                - Comparaison Standard vs EWC (Elastic Weight Consolidation)
+                - Comparaison Standard vs méthodes d'apprentissage continu
                 - Seuils d'alerte et recommandations techniques
                 
-                **🧠 EWC (Elastic Weight Consolidation):**
-                - Technique state-of-the-art pour réduire l'oubli catastrophique
-                - Calcul de la Fisher Information Matrix pour identifier les poids critiques
-                - Régularisation adaptative basée sur l'importance des paramètres
+                **🧠 Méthodes d'apprentissage continu disponibles:**
+                - **EWC (Elastic Weight Consolidation)** : Utilise la Fisher Information Matrix pour préserver les poids importants
+                - **LwF (Learning without Forgetting)** : Distillation de connaissances avec le modèle original comme teacher
+                - **MAS (Memory Aware Synapses)** : Basé sur l'importance des gradients de sortie
+                
+                **⚖️ Paramètre Lambda** : Contrôle le trade-off entre nouvelle tâche et préservation des anciennes (uniquement pour EWC)
                 
                 #### 🔧 Configuration Technique
                 - Utilise PyTorch et Transformers
                 - Support GPU/CPU automatique
-                - Limitation des données pour les tests (performance)
+                - Limitation des données pour optimiser la vitesse d'exécution
                 
                 #### ⚠️ Notes Importantes
                 
-                **Onglets Simulation vs Réel :**
-                - **Onglet 2 (Simulation)** : Démonstration pédagogique des concepts
-                - **Onglet 3 (RÉEL)** : Mesures scientifiques précises avec fine-tuning effectif
-                
                 **Performance :**
-                - Simulation : ~2-5 minutes
-                - Évaluation réelle : ~5-15 minutes (selon époques)
+                - Comparaison des modèles : ~2-5 minutes
+                - Évaluation oubli catastrophique : ~5-15 minutes (selon époques et méthode)
                 - Les résultats peuvent varier selon le matériel disponible
                 
                 **Données :**
                 - Sous-ensembles utilisés pour optimiser la vitesse d'exécution
                 - Résultats représentatifs du comportement complet
+                - Classes RVL-CDIP : 16 classes de documents (letters, forms, emails, etc.)
+                
+                **Recommandations d'utilisation :**
+                - Commencez avec 2-3 classes cibles pour tester
+                - Utilisez 3-5 époques pour un bon compromis temps/résultats
+                - Testez différentes méthodes continual learning pour comparer
+                - Lambda entre 1000-5000 généralement optimal
                 """)
     
     return demo
