@@ -393,12 +393,12 @@ def main(resume_from_checkpoint=None):
     
     # Better weight initialization for faster convergence (only if not resuming)
     if not resume_from_checkpoint:
-    for name, param in student_model.named_parameters():
-        if 'classifier' in name or 'head' in name:
-            if param.dim() > 1:
-                torch.nn.init.xavier_normal_(param, gain=0.02)
-            else:
-                torch.nn.init.zeros_(param)
+        for name, param in student_model.named_parameters():
+            if 'classifier' in name or 'head' in name:
+                if param.dim() > 1:
+                    torch.nn.init.xavier_normal_(param, gain=0.02)
+                else:
+                    torch.nn.init.zeros_(param)
     
     print(f"Teacher parameters: {sum(p.numel() for p in teacher_model.parameters()):,}")
     print(f"Student parameters: {sum(p.numel() for p in student_model.parameters()):,}")
@@ -417,34 +417,34 @@ def main(resume_from_checkpoint=None):
             print("Generating teacher soft labels...")
             # Quick baseline check - evaluate untrained student (only if not resuming)
             if not resume_from_checkpoint:
-    print("Evaluating untrained student model...")
-    temp_val_dataset = DistillationDataset(val_dataset, processor)
-    temp_val_loader = DataLoader(temp_val_dataset, batch_size=256, shuffle=False, num_workers=0)
-    
-    student_model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch in temp_val_loader:
-            if total >= 1000:  # Quick check on 1000 samples
-                break
-            pixel_values = batch['pixel_values'].to(device)
-            labels = batch['labels'].to(device)
-            outputs = student_model(pixel_values)
-            _, predicted = torch.max(outputs.logits.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    
-    baseline_acc = 100 * correct / total
-    print(f"Untrained student baseline accuracy: {baseline_acc:.2f}%")
-    
-    temp_train_dataset = DistillationDataset(train_dataset, processor)
-    temp_train_loader = DataLoader(temp_train_dataset, batch_size=64, shuffle=False, num_workers=0)
-    
-    # Generate teacher predictions with lower temperature for sharper targets
-    teacher_logits, teacher_cls_tokens = generate_teacher_predictions(
-        teacher_model, temp_train_loader, temperature=3.0  # Lower temperature for sharper targets
-    )
+                print("Evaluating untrained student model...")
+                temp_val_dataset = DistillationDataset(val_dataset, processor)
+                temp_val_loader = DataLoader(temp_val_dataset, batch_size=256, shuffle=False, num_workers=0)
+                
+                student_model.eval()
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    for batch in temp_val_loader:
+                        if total >= 1000:  # Quick check on 1000 samples
+                            break
+                        pixel_values = batch['pixel_values'].to(device)
+                        labels = batch['labels'].to(device)
+                        outputs = student_model(pixel_values)
+                        _, predicted = torch.max(outputs.logits.data, 1)
+                        total += labels.size(0)
+                        correct += (predicted == labels).sum().item()
+                
+                baseline_acc = 100 * correct / total
+                print(f"Untrained student baseline accuracy: {baseline_acc:.2f}%")
+            
+            temp_train_dataset = DistillationDataset(train_dataset, processor)
+            temp_train_loader = DataLoader(temp_train_dataset, batch_size=64, shuffle=False, num_workers=0)
+            
+            # Generate teacher predictions with lower temperature for sharper targets
+            teacher_logits, teacher_cls_tokens = generate_teacher_predictions(
+                teacher_model, temp_train_loader, temperature=3.0  # Lower temperature for sharper targets
+            )
             
             # Save teacher logits for future use
             torch.save(teacher_logits, teacher_logits_file)
@@ -490,5 +490,5 @@ def main(resume_from_checkpoint=None):
 
 if __name__ == "__main__":
     # To resume from checkpoint, change this to the checkpoint path
-    resume_checkpoint = "checkpoint_epoch_50.pth"  # Set to None to start from scratch
+    resume_checkpoint = None  # Set to None to start from scratch
     main(resume_from_checkpoint=resume_checkpoint)
