@@ -393,12 +393,12 @@ def main(resume_from_checkpoint=None):
     
     # Better weight initialization for faster convergence (only if not resuming)
     if not resume_from_checkpoint:
-    for name, param in student_model.named_parameters():
-        if 'classifier' in name or 'head' in name:
-            if param.dim() > 1:
-                torch.nn.init.xavier_normal_(param, gain=0.02)
-            else:
-                torch.nn.init.zeros_(param)
+        for name, param in student_model.named_parameters():
+            if 'classifier' in name or 'head' in name:
+                if param.dim() > 1:
+                    torch.nn.init.xavier_normal_(param, gain=0.02)
+                else:
+                    torch.nn.init.zeros_(param)
     
     print(f"Teacher parameters: {sum(p.numel() for p in teacher_model.parameters()):,}")
     print(f"Student parameters: {sum(p.numel() for p in student_model.parameters()):,}")
